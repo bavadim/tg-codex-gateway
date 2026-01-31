@@ -2,7 +2,7 @@ import argparse
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -26,17 +26,91 @@ def load_env(path: Path) -> None:
             os.environ[key] = value
 
 
-def get_allowed_users(raw: str) -> Set[int]:
-    allowed: Set[int] = set()
+def parse_allowed_entries(raw: str) -> List[str]:
+    entries: List[str] = []
     for part in raw.split(","):
         part = part.strip()
-        if not part:
+        if part:
+            entries.append(part)
+    return entries
+
+
+def iter_chat_candidates(raw: str) -> Iterable[str]:
+    yield raw
+    trimmed = raw.strip()
+    if trimmed.startswith("@"):
+        yield trimmed[1:]
+    cleaned = trimmed
+    for prefix in ("https://", "http://"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+    if cleaned.startswith("t.me/"):
+        tail = cleaned[len("t.me/") :]
+        if tail:
+            yield tail
+
+
+def extract_username(raw: str) -> Optional[str]:
+    trimmed = raw.strip()
+    if trimmed.startswith("@"):
+        trimmed = trimmed[1:]
+    for prefix in ("https://", "http://"):
+        if trimmed.startswith(prefix):
+            trimmed = trimmed[len(prefix) :]
+    if trimmed.startswith("t.me/"):
+        trimmed = trimmed[len("t.me/") :]
+    if not trimmed or trimmed.startswith("+") or "/" in trimmed:
+        return None
+    return trimmed
+
+
+def resolve_allowed_entries(
+    app: Client, entries: List[str]
+) -> Tuple[Set[int], Set[int]]:
+    allowed_users: Set[int] = set()
+    allowed_chats: Set[int] = set()
+    unresolved: List[str] = []
+
+    for entry in entries:
+        if entry.lstrip("-").isdigit():
+            value = int(entry)
+            allowed_users.add(value)
+            allowed_chats.add(value)
             continue
-        try:
-            allowed.add(int(part))
-        except ValueError:
+
+        chat = None
+        for candidate in iter_chat_candidates(entry):
+            try:
+                chat = app.get_chat(candidate)
+                break
+            except Exception:
+                continue
+
+        if chat is None:
+            username = extract_username(entry)
+            if username:
+                try:
+                    chat = app.get_users(username)
+                except Exception:
+                    chat = None
+
+        if chat is None:
+            unresolved.append(entry)
             continue
-    return allowed
+
+        if getattr(chat, "type", None) == "private":
+            allowed_users.add(chat.id)
+        else:
+            allowed_chats.add(chat.id)
+
+    if unresolved:
+        joined = ", ".join(unresolved)
+        raise SystemExit(
+            "Не удалось разрешить записи ALLOWED_CHAT_USER_IDS: "
+            f"{joined}"
+        )
+
+    return allowed_users, allowed_chats
 
 
 def message_to_line(msg) -> str:
@@ -71,7 +145,7 @@ def build_prompt(chat_logs: Dict[int, List[str]], chat_id: int) -> str:
     return header + lines
 
 
-def run_codex(prompt: str, workdir: Path, codex_model: Optional[str]) -> str:
+def run_codex(prompt: str, workdir: Path) -> str:
     cmd = [
         "codex",
         "exec",
@@ -83,9 +157,6 @@ def run_codex(prompt: str, workdir: Path, codex_model: Optional[str]) -> str:
         str(workdir),
         "-",
     ]
-    if codex_model:
-        cmd += ["--model", codex_model]
-
     env = os.environ.copy()
 
     result = subprocess.run(
@@ -121,16 +192,13 @@ def main() -> None:
     telegram_api_hash = os.environ.get("TELEGRAM_API_HASH")
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-    repo = os.environ.get("REPO")
-    codex_model = os.environ.get("CODEX_MODEL")
-
-    allowed_users = get_allowed_users(os.environ.get("ALLOWED_CHAT_USER_IDS", ""))
+    allowed_entries = parse_allowed_entries(
+        os.environ.get("ALLOWED_CHAT_USER_IDS", "")
+    )
 
     if not telegram_api_id or not telegram_api_hash or not telegram_bot_token:
         raise SystemExit("Missing TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_BOT_TOKEN")
-    if not repo:
-        raise SystemExit("Missing REPO env (owner/name)")
-    if not allowed_users:
+    if not allowed_entries:
         raise SystemExit("Missing ALLOWED_CHAT_USER_IDS")
 
     chat_logs: Dict[int, List[str]] = {}
@@ -146,6 +214,16 @@ def main() -> None:
         api_hash=telegram_api_hash,
         bot_token=telegram_bot_token,
     )
+
+    app.start()
+    try:
+        allowed_users, allowed_chats = resolve_allowed_entries(app, allowed_entries)
+    finally:
+        app.stop()
+
+    if not allowed_users and not allowed_chats:
+        raise SystemExit("Missing ALLOWED_CHAT_USER_IDS")
+    authorized_chats.update(allowed_chats)
 
     def is_allowed_user(message) -> bool:
         if not message.from_user:
@@ -164,7 +242,7 @@ def main() -> None:
         line = message_to_line(message)
         append_log(chat_logs, message.chat.id, line)
 
-    @app.on_message(filters.command(["help", "status", "set_repo"]))
+    @app.on_message(filters.command(["help"]))
     def commands(_, message):
         if not is_allowed_user(message):
             message.reply_text("Нет доступа")
@@ -173,26 +251,10 @@ def main() -> None:
         if text.startswith("/help"):
             reply = (
                 "Я PM-бот. Упоминание запускает анализ последних 30 сообщений.\n"
-                "Команды: /status, /set_repo owner/name"
+                "Команды: /help"
             )
             message.reply_text(reply)
             return
-
-        if text.startswith("/status"):
-            reply = (
-                f"REPO: {os.environ.get('REPO','')}\n"
-                f"MODEL: {os.environ.get('CODEX_MODEL','')}"
-            )
-            message.reply_text(reply)
-            return
-
-        if text.startswith("/set_repo"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                message.reply_text("Укажи репозиторий: /set_repo owner/name")
-                return
-            os.environ["REPO"] = parts[1].strip()
-            message.reply_text(f"REPO обновлен: {os.environ['REPO']}")
 
     @app.on_message(filters.group | filters.private)
     def mention_handler(_, message):
@@ -232,7 +294,7 @@ def main() -> None:
         prompt = build_prompt(chat_logs, message.chat.id)
         answer = ""
         try:
-            answer = run_codex(prompt, codex_workdir, codex_model)
+        answer = run_codex(prompt, codex_workdir)
             if not answer:
                 raise RuntimeError("Empty response from codex")
             message.reply_text(

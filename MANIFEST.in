@@ -1,4 +1,4 @@
 include README.md
 include requirements.txt
-include .env.example
+include env.example
 include gateway.py

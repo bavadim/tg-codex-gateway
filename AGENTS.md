@@ -5,13 +5,13 @@
 - `telegram_codex_gateway/cli.py` is the package entry point used by the console script.
 - `README.md` documents setup and usage.
 - `requirements.txt` lists Python dependencies.
-- `.env.example` provides required configuration keys; copy to `.env`.
+- `env.example` provides required configuration keys; copy to `.env`.
 - There is no separate `tests/` directory at present.
 
 ## Build, Test, and Development Commands
 - `pip install -r requirements.txt` installs runtime dependencies.
 - `python gateway.py --codex-dir /path/to/repo` runs the bot and forwards chat context to the local `codex` CLI working directory.
-- `cp .env.example .env` prepares local configuration.
+- `cp env.example .env` prepares local configuration.
 
 ## Coding Style & Naming Conventions
 - Python: follow PEP 8 conventions, 4-space indentation.
