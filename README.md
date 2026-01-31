@@ -4,9 +4,9 @@ A gateway bot that connects Telegram chats with Codex, forwarding recent message
 
 ## Setup
 
-1) Install dependencies:
+1) Install the package (editable for local dev):
 ```
-pip install -r requirements.txt
+pip install -e .
 ```
 
 2) Install required Codex skills via the Codex skill installer:
@@ -19,17 +19,34 @@ codex skill install <skill-name-or-repo>
 cp .env.example .env
 ```
 
-4) Run:
-```
-python bot.py --codex-dir /path/to/repo
-```
-
 ## Environment variables
 
 - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_BOT_TOKEN`: Telegram credentials.
 - `REPO`: GitHub repo in `owner/name` format.
 - `CODEX_MODEL`: Optional model override for `codex`.
 - `ALLOWED_CHAT_USER_IDS`: Comma-separated Telegram user IDs allowed to authorize chats.
+
+## Running the bot
+
+Before запуском нужен файл `.env` с настройками (см. шаги выше). Экспортируй переменные в shell перед стартом. Пример для bash:
+```
+export TELEGRAM_API_ID="123456"
+export TELEGRAM_API_HASH="0123456789abcdef0123456789abcdef"
+export TELEGRAM_BOT_TOKEN="123456:bot-token"
+export REPO="owner/name"
+export CODEX_MODEL="gpt-5"
+export ALLOWED_CHAT_USER_IDS="111111111,222222222"
+```
+
+Запуск:
+```
+telegram-codex-gateway --codex-dir /path/to/repo
+```
+
+Для локального запуска без установки:
+```
+python gateway.py --codex-dir /path/to/repo
+```
 
 ## Codex workspace requirements
 
