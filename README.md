@@ -24,6 +24,11 @@ codex skill install <skill-name-or-repo>
 cp env.example .env
 ```
 
+If you only need runtime dependencies without installing the console script:
+```
+pip install -r requirements.txt
+```
+
 ## Configuration
 
 Environment variables:
