@@ -1,6 +1,6 @@
 # Telegram -> Codex Gateway
 
-A Pyrogram bot that forwards the last 30 chat messages to Codex and returns the result to Telegram. The bot runs the `codex` CLI locally and uses the repo you specify in `.env` for context.
+A gateway bot that connects Telegram chats with Codex, forwarding recent messages to Codex and relaying the response back to Telegram. The bot runs the `codex` CLI locally and uses the repo you specify in `.env` for context.
 
 ## Setup
 
@@ -9,10 +9,9 @@ A Pyrogram bot that forwards the last 30 chat messages to Codex and returns the 
 pip install -r requirements.txt
 ```
 
-2) Install the skills:
+2) Install required Codex skills via the Codex skill installer:
 ```
-cp -r ../codex-pm-skill/github-issues ~/.codex/skills/
-cp -r ../codex-pm-skill/pm ~/.codex/skills/
+codex skill install <skill-name-or-repo>
 ```
 
 3) Create `.env` from example and fill values:
@@ -32,8 +31,22 @@ python bot.py --codex-dir /path/to/repo
 - `CODEX_MODEL`: Optional model override for `codex`.
 - `ALLOWED_CHAT_USER_IDS`: Comma-separated Telegram user IDs allowed to authorize chats.
 
+## Codex workspace requirements
+
+The directory passed to `--codex-dir` should be a ready Codex workspace:
+- Contains the repo context Codex should read and edit (the target project).
+- Includes an `AGENTS.md` with local contributor/agent instructions.
+- Skills are installed via the Codex skill installer and available to the CLI (typically under `$CODEX_HOME/skills` or a project-local `.codex/skills`).
+
+## How the gateway works
+
+- The bot keeps a rolling log of the last 30 messages per chat.
+- A chat is authorized only after a user from `ALLOWED_CHAT_USER_IDS` posts there.
+- In group chats, the bot responds when it is @mentioned or replied to.
+- In private chats, the allowed user can mention or reply to the bot to trigger a Codex run.
+- The prompt sent to Codex is the chat log in chronological order.
+
 ## Notes
 
 - Access is restricted via `ALLOWED_CHAT_USER_IDS`. A chat becomes authorized only after an allowed user posts there.
 - The bot expects `codex` CLI on PATH.
-- The PM prompt is stored in the `pm` skill inside `codex-pm-skill/pm/PROMPT.md`.
