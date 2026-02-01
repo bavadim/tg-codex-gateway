@@ -32,7 +32,7 @@ pip install -r requirements.txt
 ## Configuration
 
 Environment variables:
-- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_BOT_TOKEN`: Telegram credentials.
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token.
 - `ALLOWED_CHAT_USER_IDS`: Comma-separated allowlist entries. Accepts numeric IDs, usernames (`@user` or `user`), and chat links (`https://t.me/your_group` or `t.me/your_group`).
 
 ## Running the bot
@@ -54,6 +54,13 @@ telegram-codex-gateway --codex-dir /path/to/repo
 Local run without installation:
 ```
 python gateway.py --codex-dir /path/to/repo
+```
+
+## Testing
+
+```
+cp .env .env.test
+pytest
 ```
 
 ## Codex workspace requirements
