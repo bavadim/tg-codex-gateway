@@ -630,6 +630,13 @@ def main() -> None:
             prompt = extract_message_text(message)
         else:
             prompt = build_group_prompt(chat_logs, chat.id)
+        request_text = extract_message_text(message)
+        logger.info(
+            "Request text: chat_id=%s prompt_type=%s text=%s",
+            chat.id,
+            "private" if chat.type == "private" else "group_log",
+            request_text.replace("\n", "\\n"),
+        )
         raw_answer = ""
         answer = ""
         session_id = chat_sessions.get(chat.id)
