@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 import contextlib
+import html
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +24,7 @@ SYSTEM_PROMPT = (
 )
 
 MAX_PLAIN_MESSAGE_LENGTH = 3900
-MAX_MARKDOWN_MESSAGE_LENGTH = 3500
+MAX_HTML_MESSAGE_LENGTH = 3500
 
 
 def parse_allowed_entries(raw: str) -> List[str]:
@@ -116,6 +118,96 @@ def extract_message_text(message) -> str:
     return message.text or message.caption or ""
 
 
+def markdown_to_telegram_html(text: str) -> str:
+    if not text:
+        return ""
+
+    token_map: Dict[str, str] = {}
+    token_index = 0
+
+    def stash(value: str) -> str:
+        nonlocal token_index
+        token = f"__TG_TOKEN_{token_index}__"
+        token_index += 1
+        token_map[token] = value
+        return token
+
+    def replace_code_blocks(value: str) -> str:
+        pattern = re.compile(r"```(?:[^\n]*)\n(.*?)```", re.DOTALL)
+
+        def repl(match: re.Match) -> str:
+            code = match.group(1) or ""
+            escaped = html.escape(code)
+            return stash(f"<pre><code>{escaped}</code></pre>")
+
+        return pattern.sub(repl, value)
+
+    def replace_inline_code(value: str) -> str:
+        pattern = re.compile(r"`([^`\n]+)`")
+
+        def repl(match: re.Match) -> str:
+            code = match.group(1) or ""
+            escaped = html.escape(code)
+            return stash(f"<code>{escaped}</code>")
+
+        return pattern.sub(repl, value)
+
+    def replace_links(value: str) -> str:
+        pattern = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+        def repl(match: re.Match) -> str:
+            label = html.escape(match.group(1) or "")
+            url = html.escape(match.group(2) or "", quote=True)
+            return stash(f'<a href="{url}">{label}</a>')
+
+        return pattern.sub(repl, value)
+
+    def replace_lists(value: str) -> str:
+        lines = value.splitlines()
+        out: List[str] = []
+        unordered = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+        ordered = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
+
+        for line in lines:
+            match = unordered.match(line)
+            if match:
+                indent = match.group(1).replace("\t", "    ")
+                level = len(indent) // 2
+                content = match.group(2)
+                prefix = "&nbsp;" * (level * 2) + "• "
+                out.append(f"{stash(prefix)}{content}")
+                continue
+            match = ordered.match(line)
+            if match:
+                indent = match.group(1).replace("\t", "    ")
+                level = len(indent) // 2
+                number = match.group(2)
+                content = match.group(3)
+                prefix = "&nbsp;" * (level * 2) + f"{number}. "
+                out.append(f"{stash(prefix)}{content}")
+                continue
+            out.append(line)
+        return "\n".join(out)
+
+    text = replace_code_blocks(text)
+    text = replace_inline_code(text)
+    text = replace_links(text)
+    text = replace_lists(text)
+
+    escaped = html.escape(text)
+
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"__(.+?)__", r"<b>\1</b>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"<i>\1</i>", escaped)
+
+    for token, value in token_map.items():
+        escaped = escaped.replace(html.escape(token), value)
+
+    return escaped
+
+
 def split_message(text: str, limit: int) -> List[str]:
     if not text:
         return [""]
@@ -146,8 +238,8 @@ async def reply_in_chunks(
     use_parse_mode = parse_mode
     limit = MAX_PLAIN_MESSAGE_LENGTH
     if parse_mode:
-        if len(text) <= MAX_MARKDOWN_MESSAGE_LENGTH:
-            limit = MAX_MARKDOWN_MESSAGE_LENGTH
+        if len(text) <= MAX_HTML_MESSAGE_LENGTH:
+            limit = MAX_HTML_MESSAGE_LENGTH
         else:
             use_parse_mode = None
             limit = MAX_PLAIN_MESSAGE_LENGTH
@@ -337,6 +429,8 @@ def setup_logging() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stderr,
     )
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     return logging.getLogger("telegram_codex_gateway")
 
 
@@ -495,15 +589,19 @@ def main() -> None:
         if not message or not chat:
             return
         logger.debug("mention_handler handler; update_id=%s", update.update_id)
-        if not is_allowed_user(message):
-            logger.debug(
-                "Message from non-allowed user; chat_id=%s from_user_id=%s from_user_username=%s",
-                chat.id,
-                getattr(message.from_user, "id", None),
-                getattr(message.from_user, "username", None),
-            )
-            return
-        if not is_authorized_chat(chat):
+        allowed_user = is_allowed_user(message)
+        logger.info(
+            "Request: chat_id=%s chat_type=%s from_user_id=%s from_user_username=%s allowed_user=%s authorized_chat=%s",
+            chat.id,
+            chat.type,
+            getattr(message.from_user, "id", None),
+            getattr(message.from_user, "username", None),
+            allowed_user,
+            is_authorized_chat(chat),
+        )
+        if allowed_user:
+            authorized_chats.add(chat.id)
+        if not allowed_user and not is_authorized_chat(chat):
             logger.debug(
                 "Chat not authorized; chat_id=%s from_user_id=%s from_user_username=%s",
                 chat.id,
@@ -511,6 +609,11 @@ def main() -> None:
                 getattr(message.from_user, "username", None),
             )
             await message.reply_text("Нет доступа")
+            logger.info(
+                "Request denied: chat_id=%s from_user_id=%s",
+                chat.id,
+                getattr(message.from_user, "id", None),
+            )
             return
         if message.from_user and message.from_user.is_bot:
             logger.debug("Ignoring bot message; chat_id=%s", chat.id)
@@ -527,14 +630,16 @@ def main() -> None:
             prompt = extract_message_text(message)
         else:
             prompt = build_group_prompt(chat_logs, chat.id)
+        raw_answer = ""
         answer = ""
         session_id = chat_sessions.get(chat.id)
         stop_typing = asyncio.Event()
         typing_task = asyncio.create_task(
             send_typing_loop(context, chat.id, stop_typing)
         )
+        start_time = asyncio.get_event_loop().time()
         try:
-            answer, new_session_id = await asyncio.to_thread(
+            raw_answer, new_session_id = await asyncio.to_thread(
                 run_codex,
                 prompt,
                 codex_workdir,
@@ -546,19 +651,27 @@ def main() -> None:
                 logger.warning(
                     "No session id returned from codex; chat_id=%s", chat.id
                 )
-            if not answer:
+            if not raw_answer:
                 raise RuntimeError("Empty response from codex")
+            answer = markdown_to_telegram_html(raw_answer)
             await reply_in_chunks(
                 message,
                 answer,
-                parse_mode=ParseMode.MARKDOWN_V2,
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+            )
+            elapsed = asyncio.get_event_loop().time() - start_time
+            logger.info(
+                "Response sent: chat_id=%s elapsed=%.2fs text=%s",
+                chat.id,
+                elapsed,
+                raw_answer.replace("\n", "\\n"),
             )
             logger.info("Replied to chat_id=%s", chat.id)
         except BadRequest:
-            safe = answer or "Ошибка: некорректный MarkdownV2"
+            safe = raw_answer or "Ошибка: некорректный HTML"
             await reply_in_chunks(message, safe)
-            logger.warning("Bad markdown response; chat_id=%s", chat.id)
+            logger.warning("Bad HTML response; chat_id=%s", chat.id)
         except Exception as exc:
             await reply_in_chunks(message, f"Ошибка: {exc}")
             logger.exception("Handler error for chat_id=%s", chat.id)
