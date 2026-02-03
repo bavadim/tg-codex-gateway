@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import contextlib
-import html
 import logging
 import os
 import re
@@ -9,6 +8,12 @@ import subprocess
 import sys
 from pathlib import Path
 import json
+import shutil
+import tarfile
+import uuid
+import zipfile
+import gzip
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from telegram import Update
@@ -16,15 +21,19 @@ from telegram.constants import ChatAction, MessageEntityType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-SYSTEM_PROMPT = (
-    "Системный промпт:\n"
-    "Ты — Другалек, уставший, циничный продукт-менеджер. "
-    "Даешь оценочные суждения задачам пользователя и формулируешь выводы. "
-    "Если видишь явные проблемы — говоришь прямо, без смягчений и без подбора выражений."
-)
-
 MAX_PLAIN_MESSAGE_LENGTH = 3900
-MAX_HTML_MESSAGE_LENGTH = 3500
+MAX_MARKDOWN_MESSAGE_LENGTH = 3500
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_EXTRACT_FILES = 2000
+SANDBOX_ROOT = Path("/tmp/tg-codex")
+SANDBOX_LINK_DIRNAME = ".tg-sandboxes"
+
+
+@dataclass
+class SandboxInfo:
+    sandbox_id: str
+    path: Path
+    link: Path
 
 
 def parse_allowed_entries(raw: str) -> List[str]:
@@ -118,94 +127,166 @@ def extract_message_text(message) -> str:
     return message.text or message.caption or ""
 
 
-def markdown_to_telegram_html(text: str) -> str:
-    if not text:
+def sanitize_filename(name: str) -> str:
+    if not name:
+        return "upload"
+    base = Path(name).name
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    return base or "upload"
+
+
+def ensure_sandbox(
+    chat_id: int,
+    codex_workdir: Path,
+    chat_sandboxes: Dict[int, SandboxInfo],
+    sandbox_id: Optional[str] = None,
+    force_new: bool = False,
+) -> SandboxInfo:
+    if not force_new and chat_id in chat_sandboxes:
+        return chat_sandboxes[chat_id]
+
+    if not sandbox_id:
+        sandbox_id = uuid.uuid4().hex
+    sandbox_id = sanitize_filename(sandbox_id)
+    path = SANDBOX_ROOT / str(chat_id) / sandbox_id
+    uploads = path / "uploads"
+    work = path / "work"
+    notes = path / "notes"
+    uploads.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    notes.mkdir(parents=True, exist_ok=True)
+
+    link_root = codex_workdir / SANDBOX_LINK_DIRNAME / str(chat_id)
+    link_root.mkdir(parents=True, exist_ok=True)
+    link = link_root / sandbox_id
+    if link.exists() or link.is_symlink():
+        if link.is_symlink():
+            link.unlink()
+        else:
+            shutil.rmtree(link, ignore_errors=True)
+    link.symlink_to(path, target_is_directory=True)
+
+    info = SandboxInfo(sandbox_id=sandbox_id, path=path, link=link)
+    chat_sandboxes[chat_id] = info
+    return info
+
+
+def is_within_directory(base: Path, target: Path) -> bool:
+    try:
+        base_resolved = base.resolve()
+        target_resolved = target.resolve()
+    except FileNotFoundError:
+        return False
+    return base_resolved == target_resolved or base_resolved in target_resolved.parents
+
+
+def extract_zip(archive: Path, dest: Path, max_files: int) -> int:
+    count = 0
+    with zipfile.ZipFile(archive) as zf:
+        for info in zf.infolist():
+            if count >= max_files:
+                break
+            target = dest / info.filename
+            if not is_within_directory(dest, target):
+                continue
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, target.open("wb") as out:
+                shutil.copyfileobj(src, out)
+            count += 1
+    return count
+
+
+def extract_tar(archive: Path, dest: Path, max_files: int) -> int:
+    count = 0
+    with tarfile.open(archive) as tf:
+        for member in tf.getmembers():
+            if count >= max_files:
+                break
+            target = dest / member.name
+            if not is_within_directory(dest, target):
+                continue
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tf.extractfile(member) as src:
+                if src is None:
+                    continue
+                with target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+            count += 1
+    return count
+
+
+def extract_gzip(archive: Path, dest: Path) -> Optional[Path]:
+    if archive.suffix != ".gz":
+        return None
+    name = archive.name
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        return None
+    target_name = name[:-3] or "archive"
+    target = dest / target_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(archive, "rb") as src, target.open("wb") as out:
+        shutil.copyfileobj(src, out)
+    return target
+
+
+def handle_archive(file_path: Path, sandbox: SandboxInfo) -> int:
+    work_dir = sandbox.path / "work"
+    if zipfile.is_zipfile(file_path):
+        return extract_zip(file_path, work_dir, MAX_EXTRACT_FILES)
+    if tarfile.is_tarfile(file_path):
+        return extract_tar(file_path, work_dir, MAX_EXTRACT_FILES)
+    extracted = extract_gzip(file_path, work_dir)
+    if extracted:
+        return 1
+    return 0
+
+
+def build_sandbox_prompt(
+    sandbox: SandboxInfo,
+    request_text: str,
+    uploaded_file: Optional[Path] = None,
+) -> str:
+    uploads = sandbox.path / "uploads"
+    work = sandbox.path / "work"
+    files: List[str] = []
+    for root in (uploads, work):
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                try:
+                    rel = path.relative_to(sandbox.path)
+                except ValueError:
+                    rel = path.name
+                files.append(str(rel))
+                if len(files) >= 200:
+                    break
+        if len(files) >= 200:
+            break
+    if not files:
         return ""
+    file_list = "\n".join(f"- {item}" for item in files)
+    uploaded_line = (
+        f"Загруженный файл: {uploaded_file}\n" if uploaded_file else ""
+    )
+    return (
+        "$log-archive-triage\n"
+        f"Запрос: {request_text}\n"
+        f"Путь к песочнице: {sandbox.link}\n"
+        f"{uploaded_line}"
+        "Доступные файлы в песочнице:\n"
+        f"{file_list}"
+    )
 
-    token_map: Dict[str, str] = {}
-    token_index = 0
 
-    def stash(value: str) -> str:
-        nonlocal token_index
-        token = f"__TG_TOKEN_{token_index}__"
-        token_index += 1
-        token_map[token] = value
-        return token
-
-    def replace_code_blocks(value: str) -> str:
-        pattern = re.compile(r"```(?:[^\n]*)\n(.*?)```", re.DOTALL)
-
-        def repl(match: re.Match) -> str:
-            code = match.group(1) or ""
-            escaped = html.escape(code)
-            return stash(f"<pre><code>{escaped}</code></pre>")
-
-        return pattern.sub(repl, value)
-
-    def replace_inline_code(value: str) -> str:
-        pattern = re.compile(r"`([^`\n]+)`")
-
-        def repl(match: re.Match) -> str:
-            code = match.group(1) or ""
-            escaped = html.escape(code)
-            return stash(f"<code>{escaped}</code>")
-
-        return pattern.sub(repl, value)
-
-    def replace_links(value: str) -> str:
-        pattern = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
-
-        def repl(match: re.Match) -> str:
-            label = html.escape(match.group(1) or "")
-            url = html.escape(match.group(2) or "", quote=True)
-            return stash(f'<a href="{url}">{label}</a>')
-
-        return pattern.sub(repl, value)
-
-    def replace_lists(value: str) -> str:
-        lines = value.splitlines()
-        out: List[str] = []
-        unordered = re.compile(r"^(\s*)[-*+]\s+(.*)$")
-        ordered = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
-
-        for line in lines:
-            match = unordered.match(line)
-            if match:
-                indent = match.group(1).replace("\t", "    ")
-                level = len(indent) // 2
-                content = match.group(2)
-                prefix = "&nbsp;" * (level * 2) + "• "
-                out.append(f"{stash(prefix)}{content}")
-                continue
-            match = ordered.match(line)
-            if match:
-                indent = match.group(1).replace("\t", "    ")
-                level = len(indent) // 2
-                number = match.group(2)
-                content = match.group(3)
-                prefix = "&nbsp;" * (level * 2) + f"{number}. "
-                out.append(f"{stash(prefix)}{content}")
-                continue
-            out.append(line)
-        return "\n".join(out)
-
-    text = replace_code_blocks(text)
-    text = replace_inline_code(text)
-    text = replace_links(text)
-    text = replace_lists(text)
-
-    escaped = html.escape(text)
-
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
-    escaped = re.sub(r"__(.+?)__", r"<b>\1</b>", escaped, flags=re.DOTALL)
-    escaped = re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped, flags=re.DOTALL)
-    escaped = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", escaped)
-    escaped = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"<i>\1</i>", escaped)
-
-    for token, value in token_map.items():
-        escaped = escaped.replace(html.escape(token), value)
-
-    return escaped
+def normalize_markdown(text: str) -> str:
+    return text or ""
 
 
 def split_message(text: str, limit: int) -> List[str]:
@@ -238,8 +319,8 @@ async def reply_in_chunks(
     use_parse_mode = parse_mode
     limit = MAX_PLAIN_MESSAGE_LENGTH
     if parse_mode:
-        if len(text) <= MAX_HTML_MESSAGE_LENGTH:
-            limit = MAX_HTML_MESSAGE_LENGTH
+        if len(text) <= MAX_MARKDOWN_MESSAGE_LENGTH:
+            limit = MAX_MARKDOWN_MESSAGE_LENGTH
         else:
             use_parse_mode = None
             limit = MAX_PLAIN_MESSAGE_LENGTH
@@ -279,37 +360,27 @@ def parse_codex_json_output(raw: str) -> Tuple[Optional[str], Optional[str]]:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if session_id is None:
-            if isinstance(payload, dict):
-                if "session_id" in payload:
-                    session_id = payload.get("session_id")
-                else:
-                    session = payload.get("session")
-                    if isinstance(session, dict):
-                        session_id = session.get("id")
-                    elif payload.get("type") == "session":
-                        session_id = payload.get("id")
-                if session_id is None:
-                    thread_id = payload.get("thread_id")
-                    if thread_id:
-                        session_id = thread_id
-                    elif payload.get("type") == "thread.started":
-                        session_id = payload.get("thread_id") or payload.get("id")
         if not isinstance(payload, dict):
             continue
+        if session_id is None:
+            session_id = payload.get("session_id")
+            if session_id is None:
+                session = payload.get("session")
+                if isinstance(session, dict):
+                    session_id = session.get("id")
+                elif payload.get("type") == "session":
+                    session_id = payload.get("id")
+            if session_id is None:
+                session_id = payload.get("thread_id")
+                if payload.get("type") == "thread.started":
+                    session_id = payload.get("thread_id") or payload.get("id")
 
         candidate = None
-        if payload.get("type") in ("message", "assistant_message", "final_message", "agent_message"):
+        payload_type = payload.get("type")
+        if payload_type in ("message", "assistant_message", "final_message", "agent_message"):
             if payload.get("role") in (None, "assistant"):
                 candidate = extract_codex_text(payload)
-        elif "message" in payload:
-            message = payload.get("message")
-            if isinstance(message, dict):
-                if message.get("role") in (None, "assistant"):
-                    candidate = extract_codex_text(message)
-            else:
-                candidate = extract_codex_text(message)
-        elif payload.get("type") == "item.completed":
+        elif payload_type == "item.completed":
             item = payload.get("item")
             if isinstance(item, dict) and item.get("type") in (
                 "agent_message",
@@ -318,6 +389,8 @@ def parse_codex_json_output(raw: str) -> Tuple[Optional[str], Optional[str]]:
                 "final_message",
             ):
                 candidate = extract_codex_text(item)
+        elif "message" in payload:
+            candidate = extract_codex_text(payload.get("message"))
         elif "response" in payload:
             response = payload.get("response")
             if isinstance(response, dict):
@@ -377,7 +450,7 @@ def run_codex(
     else:
         cmd = base_cmd + ["--json", "-C", str(workdir)]
         cmd.append("-")
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
+        full_prompt = prompt
         cwd = None
 
     answer, new_session_id, _ = run_codex_command(
@@ -406,6 +479,83 @@ async def send_typing_loop(
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             continue
+
+
+async def run_codex_and_reply(
+    message,
+    prompt: str,
+    codex_workdir: Path,
+    chat_id: int,
+    chat_sessions: Dict[int, str],
+    chat_sandboxes: Dict[int, SandboxInfo],
+    logger: logging.Logger,
+    context: ContextTypes.DEFAULT_TYPE,
+    log_label: str,
+) -> None:
+    raw_answer = ""
+    session_id = chat_sessions.get(chat_id)
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        send_typing_loop(context, chat_id, stop_typing)
+    )
+    start_time = asyncio.get_event_loop().time()
+    try:
+        raw_answer, new_session_id = await asyncio.to_thread(
+            run_codex,
+            prompt,
+            codex_workdir,
+            session_id,
+        )
+        if new_session_id:
+            if session_id and session_id != new_session_id:
+                ensure_sandbox(
+                    chat_id,
+                    codex_workdir,
+                    chat_sandboxes,
+                    sandbox_id=new_session_id,
+                    force_new=True,
+                )
+            elif session_id is None and chat_id not in chat_sandboxes:
+                ensure_sandbox(
+                    chat_id,
+                    codex_workdir,
+                    chat_sandboxes,
+                    sandbox_id=new_session_id,
+                )
+            chat_sessions[chat_id] = new_session_id
+        elif session_id is None:
+            logger.warning(
+                "No session id returned from codex; chat_id=%s", chat_id
+            )
+        if not raw_answer:
+            raise RuntimeError("Empty response from codex")
+        answer = normalize_markdown(raw_answer)
+        await reply_in_chunks(
+            message,
+            answer,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        elapsed = asyncio.get_event_loop().time() - start_time
+        logger.info(
+            "%s: chat_id=%s elapsed=%.2fs text=%s",
+            log_label,
+            chat_id,
+            elapsed,
+            raw_answer.replace("\n", "\\n"),
+        )
+    except BadRequest:
+        safe = raw_answer or "Ошибка: некорректный Markdown"
+        await reply_in_chunks(message, safe)
+        logger.warning("Bad Markdown response; chat_id=%s", chat_id)
+    except Exception as exc:
+        await reply_in_chunks(message, f"Ошибка: {exc}")
+        logger.exception("Handler error for chat_id=%s", chat_id)
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
 
 
 def parse_args() -> argparse.Namespace:
@@ -459,6 +609,7 @@ def main() -> None:
 
     chat_logs: Dict[int, List[str]] = {}
     chat_sessions: Dict[int, str] = {}
+    chat_sandboxes: Dict[int, SandboxInfo] = {}
     authorized_chats: Set[int] = set()
 
     app = ApplicationBuilder().token(telegram_bot_token).build()
@@ -569,6 +720,80 @@ def main() -> None:
         line = message_to_line(message)
         append_log(chat_logs, chat.id, line)
 
+    async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        chat = update.effective_chat
+        if not message or not chat:
+            return
+        document = message.document
+        if not document:
+            return
+        request_text = extract_message_text(message).strip()
+        if not request_text:
+            request_text = "Проверь логи и определи основные ошибки и аномалии."
+        if is_allowed_user(message):
+            authorized_chats.add(chat.id)
+        if not is_authorized_chat(chat):
+            await message.reply_text("Нет доступа")
+            return
+        if document.file_size and document.file_size > MAX_UPLOAD_BYTES:
+            await message.reply_text("Файл слишком большой")
+            return
+
+        sandbox = ensure_sandbox(chat.id, codex_workdir, chat_sandboxes)
+        uploads_dir = sandbox.path / "uploads"
+        work_dir = sandbox.path / "work"
+        filename = sanitize_filename(document.file_name or document.file_unique_id)
+        destination = uploads_dir / filename
+        try:
+            tg_file = await document.get_file()
+            await tg_file.download_to_drive(custom_path=str(destination))
+        except Exception:
+            logger.exception("Failed to download file; chat_id=%s", chat.id)
+            await message.reply_text("Не удалось скачать файл")
+            return
+
+        extracted = 0
+        try:
+            extracted = handle_archive(destination, sandbox)
+            if extracted == 0:
+                target = work_dir / filename
+                if target != destination:
+                    shutil.copy2(destination, target)
+        except Exception:
+            logger.exception("Failed to process file; chat_id=%s", chat.id)
+            await message.reply_text("Не удалось обработать файл")
+            return
+
+        extra = f", распаковано файлов: {extracted}" if extracted else ""
+        logger.info(
+            "Document request: chat_id=%s text=%s",
+            chat.id,
+            request_text.replace("\n", "\\n"),
+        )
+        sandbox_prompt = build_sandbox_prompt(
+            sandbox,
+            request_text,
+            uploaded_file=sandbox.link / filename,
+        )
+        if not sandbox_prompt:
+            await message.reply_text(
+                f"Файл сохранен: {sandbox.link}/{filename}{extra}"
+            )
+            return
+        prompt = sandbox_prompt
+        await run_codex_and_reply(
+            message=message,
+            prompt=prompt,
+            codex_workdir=codex_workdir,
+            chat_id=chat.id,
+            chat_sessions=chat_sessions,
+            chat_sandboxes=chat_sandboxes,
+            logger=logger,
+            context=context,
+            log_label="Document response sent",
+        )
+
     async def commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         if not message or not is_allowed_user(message):
@@ -626,70 +851,38 @@ def main() -> None:
                 logger.debug("Bot not mentioned; chat_id=%s", chat.id)
                 return
 
+        request_text = extract_message_text(message)
         if chat.type == "private":
-            prompt = extract_message_text(message)
+            prompt = request_text
         else:
             prompt = build_group_prompt(chat_logs, chat.id)
-        request_text = extract_message_text(message)
+        sandbox = chat_sandboxes.get(chat.id)
+        if sandbox:
+            sandbox_prompt = build_sandbox_prompt(sandbox, request_text)
+            if sandbox_prompt:
+                prompt = f"{prompt}\n\n{sandbox_prompt}"
         logger.info(
             "Request text: chat_id=%s prompt_type=%s text=%s",
             chat.id,
             "private" if chat.type == "private" else "group_log",
             request_text.replace("\n", "\\n"),
         )
-        raw_answer = ""
-        answer = ""
-        session_id = chat_sessions.get(chat.id)
-        stop_typing = asyncio.Event()
-        typing_task = asyncio.create_task(
-            send_typing_loop(context, chat.id, stop_typing)
+        await run_codex_and_reply(
+            message=message,
+            prompt=prompt,
+            codex_workdir=codex_workdir,
+            chat_id=chat.id,
+            chat_sessions=chat_sessions,
+            chat_sandboxes=chat_sandboxes,
+            logger=logger,
+            context=context,
+            log_label="Response sent",
         )
-        start_time = asyncio.get_event_loop().time()
-        try:
-            raw_answer, new_session_id = await asyncio.to_thread(
-                run_codex,
-                prompt,
-                codex_workdir,
-                session_id,
-            )
-            if new_session_id:
-                chat_sessions[chat.id] = new_session_id
-            elif session_id is None:
-                logger.warning(
-                    "No session id returned from codex; chat_id=%s", chat.id
-                )
-            if not raw_answer:
-                raise RuntimeError("Empty response from codex")
-            answer = markdown_to_telegram_html(raw_answer)
-            await reply_in_chunks(
-                message,
-                answer,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            elapsed = asyncio.get_event_loop().time() - start_time
-            logger.info(
-                "Response sent: chat_id=%s elapsed=%.2fs text=%s",
-                chat.id,
-                elapsed,
-                raw_answer.replace("\n", "\\n"),
-            )
-            logger.info("Replied to chat_id=%s", chat.id)
-        except BadRequest:
-            safe = raw_answer or "Ошибка: некорректный HTML"
-            await reply_in_chunks(message, safe)
-            logger.warning("Bad HTML response; chat_id=%s", chat.id)
-        except Exception as exc:
-            await reply_in_chunks(message, f"Ошибка: {exc}")
-            logger.exception("Handler error for chat_id=%s", chat.id)
-        finally:
-            stop_typing.set()
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing_task
+        logger.info("Replied to chat_id=%s", chat.id)
 
     app.add_handler(MessageHandler(filters.ALL, capture_messages), group=0)
     app.add_handler(CommandHandler("help", commands), group=1)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document), group=1)
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS | filters.ChatType.PRIVATE, mention_handler
