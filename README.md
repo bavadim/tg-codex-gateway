@@ -1,84 +1,67 @@
-# Telegram -> Codex Gateway
+# TG Agent Gateway
 
-A gateway bot that connects Telegram chats with Codex, forwarding recent messages to Codex and relaying the response back to Telegram. The bot runs the `codex` CLI locally and uses the repo you pass via `--codex-dir` for context.
+Telegram-бот, который запускает `opencode` на локальной папке проекта и пересылает ответы в Telegram.
 
-## Requirements
+## Что нужно
 
 - Python 3.9+
-- `codex` CLI available on PATH
+- установленный `opencode`
+- Telegram bot token
 
-## Setup
+Проверка установки `opencode`:
 
-1) Install the package (editable for local dev):
-```
-pip install -e .
-```
-
-2) Install required Codex skills via the Codex skill installer:
-```
-codex skill install <skill-name-or-repo>
+```bash
+opencode --version
 ```
 
-3) Create `.env` from example and fill values:
+## Установка
+
+Сборка и установка пакета:
+
+```bash
+python -m build --wheel
+pip install dist/tg_agent_gateway-*.whl
 ```
+
+Для локальной разработки:
+
+```bash
+./scripts/dev-install.sh
+```
+
+## Настройка
+
+Скопируй пример и заполни `.env`:
+
+```bash
 cp env.example .env
 ```
 
-If you only need runtime dependencies without installing the console script:
-```
-pip install -r requirements.txt
-```
+Переменные:
 
-## Configuration
+- `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
+- `ALLOWED_CHAT_USER_IDS` — список разрешённых пользователей/чатов
+- `AGENT_BACKEND=opencode`
+- `OPENCODE_BIN=opencode`
+- `OPENCODE_MODEL=myopenai/gpt-5`
+- `OPENAI_API_BASE=https://openai.bavadim.xyz/v1`
+- `OPENAI_API_KEY` — ключ для OpenAI-compatible API
 
-Environment variables:
-- `TELEGRAM_BOT_TOKEN`: Telegram bot token.
-- `ALLOWED_CHAT_USER_IDS`: Comma-separated allowlist entries. Accepts numeric IDs, usernames (`@user` or `user`), and chat links (`https://t.me/your_group` or `t.me/your_group`).
+Gateway сам собирает runtime-конфиг для `opencode` из этих env. Дополнительный `opencode.json` в папке проекта не нужен.
 
-## Running the bot
+## Запуск
 
-You must have a `.env` file with configuration before starting the bot (see Setup above). Export variables into your shell before running.
+Загрузи переменные из `.env` и запусти бота на папке проекта:
 
-Example (bash):
-```
+```bash
 set -a
 source .env
 set +a
+tg-agent-gateway --workdir /path/to/your/project
 ```
 
-Run:
-```
-telegram-codex-gateway --codex-dir /path/to/repo
-```
+## Что важно
 
-Local run without installation:
-```
-python gateway.py --codex-dir /path/to/repo
-```
-
-## Testing
-
-```
-cp .env .env.test
-pytest
-```
-
-## Codex workspace requirements
-
-The directory passed to `--codex-dir` should be a ready Codex workspace:
-- Contains the repo context Codex should read and edit (the target project).
-- Includes an `AGENTS.md` with local contributor/agent instructions.
-- Skills are installed via the Codex skill installer and available to the CLI (typically under `$CODEX_HOME/skills` or a project-local `.codex/skills`).
-
-## How the gateway works
-
-- The bot keeps a rolling log of the last 30 messages per chat.
-- A chat is authorized either by being listed in `ALLOWED_CHAT_USER_IDS` or after an allowed user posts there.
-- In group chats, the bot responds when it is @mentioned or replied to.
-- In private chats, the allowed user can mention or reply to the bot to trigger a Codex run.
-- The prompt sent to Codex is the chat log in chronological order.
-
-## Notes
-
-- Access is restricted via `ALLOWED_CHAT_USER_IDS`. User entries authorize chats after they post; chat links authorize the chat immediately.
-- The bot expects `codex` CLI on PATH.
+- `--workdir` должен указывать на папку проекта, где лежит твой код
+- если в проекте есть `AGENTS.md` и `.opencode/skills`, `opencode` их увидит
+- доступ к боту ограничен через `ALLOWED_CHAT_USER_IDS`

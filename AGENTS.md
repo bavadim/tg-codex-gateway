@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `gateway.py` is the main Pyrogram bot entry point for local runs.
+- `gateway.py` is the main bot entry point for local runs.
 - `telegram_codex_gateway/cli.py` is the package entry point used by the console script.
 - `README.md` documents setup and usage.
 - `requirements.txt` lists Python dependencies.
@@ -10,7 +10,7 @@
 
 ## Build, Test, and Development Commands
 - `pip install -r requirements.txt` installs runtime dependencies.
-- `python gateway.py --codex-dir /path/to/repo` runs the bot and forwards chat context to the local `codex` CLI working directory.
+- `python gateway.py --workdir /path/to/repo` runs the bot and forwards chat context to the selected agent CLI working directory.
 - `cp env.example .env` prepares local configuration.
 
 ## Coding Style & Naming Conventions
@@ -25,11 +25,11 @@
 
 ## Commit & Pull Request Guidelines
 - Git history does not show a consistent commit message convention yet.
-- Use concise, imperative commit messages (e.g., `Add codex-dir flag to bot`).
+- Use concise, imperative commit messages (e.g., `Add opencode backend`).
 - Pull requests should include: a short summary, how to run/test changes, and any config updates.
 - When a user asks for commits, split changes into logical commits with clear messages, then `git push` after confirming the branch is correct.
 
 ## Security & Configuration Tips
 - Do not commit `.env` files or real credentials.
 - `ALLOWED_CHAT_USER_IDS` controls who can authorize chats; keep it strict.
-- Ensure the `codex` CLI is installed and available on `PATH` before running the bot.
+- Ensure the selected agent CLI (`codex` or `opencode`) is installed and available on `PATH` before running the bot.
