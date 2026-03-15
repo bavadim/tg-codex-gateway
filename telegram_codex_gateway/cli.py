@@ -29,7 +29,7 @@ MAX_PLAIN_MESSAGE_LENGTH = 3900
 MAX_MARKDOWN_MESSAGE_LENGTH = 3500
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_EXTRACT_FILES = 2000
-SANDBOX_ROOT = Path("/tmp/tg-codex")
+SANDBOX_ROOT = Path("/tmp/tg-agent-gateway")
 SANDBOX_LINK_DIRNAME = ".tg-sandboxes"
 
 
@@ -150,7 +150,7 @@ def sanitize_filename(name: str) -> str:
 
 def ensure_sandbox(
     chat_id: int,
-    codex_workdir: Path,
+    workdir: Path,
     chat_sandboxes: Dict[int, SandboxInfo],
     sandbox_id: Optional[str] = None,
     force_new: bool = False,
@@ -169,7 +169,7 @@ def ensure_sandbox(
     work.mkdir(parents=True, exist_ok=True)
     notes.mkdir(parents=True, exist_ok=True)
 
-    link_root = codex_workdir / SANDBOX_LINK_DIRNAME / str(chat_id)
+    link_root = workdir / SANDBOX_LINK_DIRNAME / str(chat_id)
     link_root.mkdir(parents=True, exist_ok=True)
     link = link_root / sandbox_id
     if link.exists() or link.is_symlink():
@@ -449,7 +449,7 @@ async def run_agent_and_reply(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Telegram gateway bot for Codex and OpenCode.",
+        description="Telegram gateway bot for OpenCode.",
     )
     parser.add_argument(
         "--workdir",
@@ -504,7 +504,7 @@ def detect_backend_name() -> str:
         return "opencode"
     if codex_keys:
         return "codex"
-    return "codex"
+    return "opencode"
 
 
 def require_binary(binary: str, backend_name: str) -> str:
@@ -520,6 +520,17 @@ def build_backend(backend_name: str) -> AgentBackend:
     if backend_name == "codex":
         binary = require_binary(os.environ.get("CODEX_BIN", "codex"), "codex")
         return CodexBackend(binary=binary)
+
+    missing = []
+    if not os.environ.get("OPENAI_API_BASE"):
+        missing.append("OPENAI_API_BASE")
+    if not os.environ.get("OPENAI_API_KEY"):
+        missing.append("OPENAI_API_KEY")
+    if missing:
+        joined = ", ".join(missing)
+        raise SystemExit(
+            f"opencode backend requires the following environment variables: {joined}"
+        )
 
     binary = require_binary(os.environ.get("OPENCODE_BIN", "opencode"), "opencode")
     server_url = os.environ.get("OPENCODE_SERVER_URL")

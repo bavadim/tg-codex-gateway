@@ -1,57 +1,67 @@
 # TG Agent Gateway
 
-Telegram-бот, который запускает `opencode` на локальной папке проекта и пересылает ответы в Telegram.
-
-## Что нужно
-
-- Python 3.9+
-- установленный `opencode`
-- Telegram bot token
-
-Проверка установки `opencode`:
-
-```bash
-opencode --version
-```
+Telegram-бот, который запускает `opencode` на локальной папке проекта. Нужен, чтобы работать с проектом из Telegram: задавать вопросы по коду, запускать агент на своей рабочей директории и, при необходимости, управлять GitHub issues через `gh`.
 
 ## Установка
 
-Сборка и установка пакета:
-
 ```bash
-python -m build --wheel
-pip install dist/tg_agent_gateway-*.whl
+python -m pip install "git+https://github.com/bavadim/tg-codex-gateway.git"
 ```
 
-Для локальной разработки:
+## Что нужно настроить
+
+Нужны:
+
+- `opencode`
+- `gh`
+- Telegram bot token
+- `.env` с переменными
+
+Установка инструментов:
 
 ```bash
-./scripts/dev-install.sh
+curl -fsSL https://opencode.ai/install | bash
+sudo apt install gh
 ```
 
-## Настройка
+### Telegram bot token
 
-Скопируй пример и заполни `.env`:
+1. Открой `@BotFather` в Telegram.
+2. Выполни `/newbot`.
+3. Задай имя и username бота.
+4. Скопируй выданный token в `TELEGRAM_BOT_TOKEN`.
+
+### Переменные окружения
+
+Создай `.env`:
 
 ```bash
 cp env.example .env
 ```
 
-Переменные:
+Заполни как минимум:
 
-- `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
-- `ALLOWED_CHAT_USER_IDS` — список разрешённых пользователей/чатов
-- `AGENT_BACKEND=opencode`
-- `OPENCODE_BIN=opencode`
-- `OPENCODE_MODEL=myopenai/gpt-5`
-- `OPENAI_API_BASE=https://openai.bavadim.xyz/v1`
-- `OPENAI_API_KEY` — ключ для OpenAI-compatible API
+```bash
+TELEGRAM_BOT_TOKEN=123456:your-bot-token
+ALLOWED_CHAT_USER_IDS=@your_username
+AGENT_BACKEND=opencode
+OPENCODE_BIN=opencode
+OPENCODE_MODEL=myopenai/gpt-5
+OPENAI_API_BASE=https://openai.bavadim.xyz/v1
+OPENAI_API_KEY=your-api-key
+GH_TOKEN=your-github-token
+```
 
-Gateway сам собирает runtime-конфиг для `opencode` из этих env. Дополнительный `opencode.json` в папке проекта не нужен.
+Кратко:
+
+- `TELEGRAM_BOT_TOKEN` — токен бота от `@BotFather`
+- `ALLOWED_CHAT_USER_IDS` — кто может пользоваться ботом
+- `OPENAI_API_BASE` и `OPENAI_API_KEY` — настройки для `opencode`
+- `GH_TOKEN` — токен для `gh`, нужен если хочешь использовать управление GitHub issues
+
+Gateway сам собирает runtime-конфиг для `opencode` из env. Дополнительный `opencode.json` в проекте не нужен.
 
 ## Запуск
-
-Загрузи переменные из `.env` и запусти бота на папке проекта:
 
 ```bash
 set -a
@@ -62,6 +72,6 @@ tg-agent-gateway --workdir /path/to/your/project
 
 ## Что важно
 
-- `--workdir` должен указывать на папку проекта, где лежит твой код
+- `--workdir` должен указывать на папку проекта
 - если в проекте есть `AGENTS.md` и `.opencode/skills`, `opencode` их увидит
-- доступ к боту ограничен через `ALLOWED_CHAT_USER_IDS`
+- вместе с gateway поставляется skill `gh-pm` для GitHub issue management через `gh`

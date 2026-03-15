@@ -14,5 +14,6 @@ fi
 mkdir -p "$DIST_DIR"
 rm -f "$DIST_DIR"/tg_agent_gateway-*.whl
 
+"$VENV_PYTHON" -m pip install --upgrade build
 "$VENV_PYTHON" -m build --wheel --outdir "$DIST_DIR"
 "$VENV_PYTHON" -m pip install --force-reinstall "$DIST_DIR"/tg_agent_gateway-*.whl
