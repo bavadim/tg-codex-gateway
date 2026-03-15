@@ -1,3 +1,32 @@
 [build-system]
-requires = ["setuptools>=67", "wheel"]
-build-backend = "setuptools.build_meta:__legacy__"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tg-agent-gateway"
+version = "0.1.0"
+description = "Telegram gateway bot for Codex and OpenCode."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "python-telegram-bot",
+]
+
+[project.scripts]
+tg-agent-gateway = "telegram_codex_gateway.cli:main"
+
+[tool.hatch.build]
+include = [
+    "/telegram_codex_gateway/**/*.py",
+    "/telegram_codex_gateway/resources/opencode/**/*",
+    "/gateway.py",
+    "/README.md",
+    "/env.example",
+]
+exclude = [
+    "**/__pycache__/**",
+    "**/*.py[cod]",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["telegram_codex_gateway"]

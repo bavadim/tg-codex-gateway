@@ -4,10 +4,8 @@ import contextlib
 import logging
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
-import json
 import shutil
 import tarfile
 import uuid
@@ -20,6 +18,12 @@ from telegram import Update
 from telegram.constants import ChatAction, MessageEntityType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+from telegram_codex_gateway.backends import (
+    AgentBackend,
+    CodexBackend,
+    OpenCodeBackend,
+)
 
 MAX_PLAIN_MESSAGE_LENGTH = 3900
 MAX_MARKDOWN_MESSAGE_LENGTH = 3500
@@ -34,6 +38,15 @@ class SandboxInfo:
     sandbox_id: str
     path: Path
     link: Path
+
+
+@dataclass
+class AppSettings:
+    telegram_bot_token: str
+    allowed_entries: List[str]
+    workdir: Path
+    backend_name: str
+    backend: AgentBackend
 
 
 def parse_allowed_entries(raw: str) -> List[str]:
@@ -332,137 +345,6 @@ async def reply_in_chunks(
         )
 
 
-def extract_codex_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts = []
-        for item in value:
-            parts.append(extract_codex_text(item))
-        return "".join(parts)
-    if isinstance(value, dict):
-        for key in ("text", "content", "value", "output_text"):
-            if key in value:
-                return extract_codex_text(value[key])
-    return ""
-
-
-def parse_codex_json_output(raw: str) -> Tuple[Optional[str], Optional[str]]:
-    answer = None
-    session_id = None
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if session_id is None:
-            session_id = payload.get("session_id")
-            if session_id is None:
-                session = payload.get("session")
-                if isinstance(session, dict):
-                    session_id = session.get("id")
-                elif payload.get("type") == "session":
-                    session_id = payload.get("id")
-            if session_id is None:
-                session_id = payload.get("thread_id")
-                if payload.get("type") == "thread.started":
-                    session_id = payload.get("thread_id") or payload.get("id")
-
-        candidate = None
-        payload_type = payload.get("type")
-        if payload_type in ("message", "assistant_message", "final_message", "agent_message"):
-            if payload.get("role") in (None, "assistant"):
-                candidate = extract_codex_text(payload)
-        elif payload_type == "item.completed":
-            item = payload.get("item")
-            if isinstance(item, dict) and item.get("type") in (
-                "agent_message",
-                "assistant_message",
-                "message",
-                "final_message",
-            ):
-                candidate = extract_codex_text(item)
-        elif "message" in payload:
-            candidate = extract_codex_text(payload.get("message"))
-        elif "response" in payload:
-            response = payload.get("response")
-            if isinstance(response, dict):
-                candidate = extract_codex_text(response.get("output_text"))
-
-        if candidate:
-            answer = candidate
-    return answer, session_id
-
-
-def run_codex_command(
-    cmd: List[str],
-    prompt: str,
-    cwd: Optional[Path],
-    env: Dict[str, str],
-    session_id: Optional[str],
-    allow_failure: bool = False,
-) -> Tuple[str, Optional[str], Optional[str]]:
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-        cwd=cwd,
-    )
-    if result.returncode != 0:
-        err = result.stderr.strip() or "codex exec failed"
-        if allow_failure:
-            return "", session_id, err
-        raise RuntimeError(err)
-    raw = (result.stdout or "").strip()
-    if not raw:
-        return "", session_id, None
-    answer, new_session_id = parse_codex_json_output(raw)
-    if not answer:
-        return "", new_session_id or session_id, None
-    return answer.strip(), new_session_id or session_id, None
-
-
-def run_codex(
-    prompt: str,
-    workdir: Path,
-    session_id: Optional[str],
-) -> Tuple[str, Optional[str]]:
-    env = os.environ.copy()
-    base_cmd = [
-        "codex",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "exec",
-    ]
-    if session_id:
-        cmd = base_cmd + ["resume", session_id, "--json", "-"]
-        full_prompt = prompt
-        cwd = workdir
-    else:
-        cmd = base_cmd + ["--json", "-C", str(workdir)]
-        cmd.append("-")
-        full_prompt = prompt
-        cwd = None
-
-    answer, new_session_id, _ = run_codex_command(
-        cmd,
-        full_prompt,
-        cwd,
-        env,
-        session_id,
-    )
-    return answer, new_session_id
-
-
 async def send_typing_loop(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -481,10 +363,12 @@ async def send_typing_loop(
             continue
 
 
-async def run_codex_and_reply(
+async def run_agent_and_reply(
     message,
     prompt: str,
-    codex_workdir: Path,
+    backend: AgentBackend,
+    backend_name: str,
+    workdir: Path,
     chat_id: int,
     chat_sessions: Dict[int, str],
     chat_sandboxes: Dict[int, SandboxInfo],
@@ -500,17 +384,20 @@ async def run_codex_and_reply(
     )
     start_time = asyncio.get_event_loop().time()
     try:
-        raw_answer, new_session_id = await asyncio.to_thread(
-            run_codex,
+        result = await asyncio.to_thread(
+            backend.run,
             prompt,
-            codex_workdir,
+            workdir,
             session_id,
+            chat_id,
         )
+        raw_answer = result.answer
+        new_session_id = result.session_id
         if new_session_id:
             if session_id and session_id != new_session_id:
                 ensure_sandbox(
                     chat_id,
-                    codex_workdir,
+                    workdir,
                     chat_sandboxes,
                     sandbox_id=new_session_id,
                     force_new=True,
@@ -518,17 +405,19 @@ async def run_codex_and_reply(
             elif session_id is None and chat_id not in chat_sandboxes:
                 ensure_sandbox(
                     chat_id,
-                    codex_workdir,
+                    workdir,
                     chat_sandboxes,
                     sandbox_id=new_session_id,
                 )
             chat_sessions[chat_id] = new_session_id
         elif session_id is None:
             logger.warning(
-                "No session id returned from codex; chat_id=%s", chat_id
+                "No session id returned from %s; chat_id=%s",
+                backend_name,
+                chat_id,
             )
         if not raw_answer:
-            raise RuntimeError("Empty response from codex")
+            raise RuntimeError(f"Empty response from {backend_name}")
         answer = normalize_markdown(raw_answer)
         await reply_in_chunks(
             message,
@@ -560,12 +449,12 @@ async def run_codex_and_reply(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Telegram -> Codex gateway bot.",
+        description="Telegram gateway bot for Codex and OpenCode.",
     )
     parser.add_argument(
-        "--codex-dir",
+        "--workdir",
         default=str(Path.cwd()),
-        help="Directory passed to codex via -C (default: current directory).",
+        help="Working directory passed to the selected agent CLI (default: current directory).",
     )
     return parser.parse_args()
 
@@ -581,10 +470,63 @@ def setup_logging() -> logging.Logger:
     )
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    return logging.getLogger("telegram_codex_gateway")
+    return logging.getLogger("tg_agent_gateway")
 
 
-def read_settings(codex_dir: str) -> Tuple[str, List[str], Path]:
+def detect_backend_name() -> str:
+    backend_name = (os.environ.get("AGENT_BACKEND") or "").strip().lower()
+    if backend_name:
+        if backend_name not in ("codex", "opencode"):
+            raise SystemExit("AGENT_BACKEND must be either 'codex' or 'opencode'")
+        return backend_name
+
+    opencode_keys = [
+        name
+        for name in (
+            "OPENCODE_BIN",
+            "OPENCODE_SERVER_URL",
+            "OPENCODE_SERVER_PASSWORD",
+        )
+        if os.environ.get(name)
+    ]
+    codex_keys = [
+        name
+        for name in (
+            "CODEX_BIN",
+        )
+        if os.environ.get(name)
+    ]
+    if opencode_keys and codex_keys:
+        raise SystemExit(
+            "Both CODEX_* and OPENCODE_* variables are set. Set AGENT_BACKEND explicitly."
+        )
+    if opencode_keys:
+        return "opencode"
+    if codex_keys:
+        return "codex"
+    return "codex"
+
+
+def require_binary(binary: str, backend_name: str) -> str:
+    resolved = shutil.which(binary)
+    if not resolved:
+        raise SystemExit(
+            f"{backend_name} backend selected, but CLI '{binary}' was not found in PATH"
+        )
+    return resolved
+
+
+def build_backend(backend_name: str) -> AgentBackend:
+    if backend_name == "codex":
+        binary = require_binary(os.environ.get("CODEX_BIN", "codex"), "codex")
+        return CodexBackend(binary=binary)
+
+    binary = require_binary(os.environ.get("OPENCODE_BIN", "opencode"), "opencode")
+    server_url = os.environ.get("OPENCODE_SERVER_URL")
+    return OpenCodeBackend(binary=binary, server_url=server_url)
+
+
+def read_settings(workdir_value: str) -> AppSettings:
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     allowed_entries = parse_allowed_entries(
         os.environ.get("ALLOWED_CHAT_USER_IDS", "")
@@ -595,17 +537,30 @@ def read_settings(codex_dir: str) -> Tuple[str, List[str], Path]:
     if not allowed_entries:
         raise SystemExit("Missing ALLOWED_CHAT_USER_IDS")
 
-    codex_workdir = Path(codex_dir).expanduser().resolve()
-    if not codex_workdir.exists():
-        raise SystemExit(f"codex dir not found: {codex_workdir}")
+    workdir = Path(workdir_value).expanduser().resolve()
+    if not workdir.exists():
+        raise SystemExit(f"workdir not found: {workdir}")
+    if not workdir.is_dir():
+        raise SystemExit(f"workdir is not a directory: {workdir}")
 
-    return telegram_bot_token, allowed_entries, codex_workdir
+    backend_name = detect_backend_name()
+    backend = build_backend(backend_name)
+    return AppSettings(
+        telegram_bot_token=telegram_bot_token,
+        allowed_entries=allowed_entries,
+        workdir=workdir,
+        backend_name=backend_name,
+        backend=backend,
+    )
 
 
 def main() -> None:
     logger = setup_logging()
     args = parse_args()
-    telegram_bot_token, allowed_entries, codex_workdir = read_settings(args.codex_dir)
+    settings = read_settings(args.workdir)
+    telegram_bot_token = settings.telegram_bot_token
+    allowed_entries = settings.allowed_entries
+    workdir = settings.workdir
 
     chat_logs: Dict[int, List[str]] = {}
     chat_sessions: Dict[int, str] = {}
@@ -643,7 +598,9 @@ def main() -> None:
         )
 
     logger.info(
-        "Startup: allowed_users=%s allowed_chats=%s usernames=%s chat_usernames=%s",
+        "Startup: backend=%s workdir=%s allowed_users=%s allowed_chats=%s usernames=%s chat_usernames=%s",
+        settings.backend_name,
+        workdir,
         sorted(allowed_users),
         sorted(allowed_chats),
         sorted(allowed_usernames),
@@ -740,7 +697,7 @@ def main() -> None:
             await message.reply_text("Файл слишком большой")
             return
 
-        sandbox = ensure_sandbox(chat.id, codex_workdir, chat_sandboxes)
+        sandbox = ensure_sandbox(chat.id, workdir, chat_sandboxes)
         uploads_dir = sandbox.path / "uploads"
         work_dir = sandbox.path / "work"
         filename = sanitize_filename(document.file_name or document.file_unique_id)
@@ -782,10 +739,12 @@ def main() -> None:
             )
             return
         prompt = sandbox_prompt
-        await run_codex_and_reply(
+        await run_agent_and_reply(
             message=message,
             prompt=prompt,
-            codex_workdir=codex_workdir,
+            backend=settings.backend,
+            backend_name=settings.backend_name,
+            workdir=workdir,
             chat_id=chat.id,
             chat_sessions=chat_sessions,
             chat_sandboxes=chat_sandboxes,
@@ -867,10 +826,12 @@ def main() -> None:
             "private" if chat.type == "private" else "group_log",
             request_text.replace("\n", "\\n"),
         )
-        await run_codex_and_reply(
+        await run_agent_and_reply(
             message=message,
             prompt=prompt,
-            codex_workdir=codex_workdir,
+            backend=settings.backend,
+            backend_name=settings.backend_name,
+            workdir=workdir,
             chat_id=chat.id,
             chat_sessions=chat_sessions,
             chat_sandboxes=chat_sandboxes,
