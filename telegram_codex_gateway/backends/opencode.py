@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -10,6 +11,9 @@ from telegram_codex_gateway.opencode_runtime import (
 )
 
 from .base import AgentRunResult
+
+
+logger = logging.getLogger("tg_agent_gateway")
 
 
 def _extract_text(value) -> str:
@@ -93,8 +97,7 @@ class OpenCodeBackend:
         session_id: Optional[str],
         chat_id: int,
     ) -> AgentRunResult:
-        del chat_id
-        runtime = build_opencode_runtime(base_env=os.environ.copy())
+        runtime = build_opencode_runtime(base_env=os.environ.copy(), chat_id=chat_id)
         try:
             env = runtime.env
             cmd = [
@@ -109,6 +112,16 @@ class OpenCodeBackend:
                 cmd.extend(["--attach", self.server_url])
             if session_id:
                 cmd.extend(["--session", session_id])
+
+            logger.info(
+                "OpenCode run: chat_id=%s session_id=%s workdir=%s xdg_data=%s xdg_cache=%s config_dir=%s",
+                chat_id,
+                session_id,
+                workdir,
+                runtime.data_dir,
+                runtime.cache_dir,
+                env.get("OPENCODE_CONFIG_DIR"),
+            )
 
             result = subprocess.run(
                 cmd,
@@ -125,8 +138,20 @@ class OpenCodeBackend:
 
             raw = (result.stdout or "").strip()
             if not raw:
+                logger.warning(
+                    "OpenCode returned empty stdout; chat_id=%s session_id=%s",
+                    chat_id,
+                    session_id,
+                )
                 return AgentRunResult(answer="", session_id=session_id)
             answer, new_session_id = parse_opencode_json_output(raw)
+            logger.info(
+                "OpenCode parsed response: chat_id=%s previous_session_id=%s new_session_id=%s answer_len=%s",
+                chat_id,
+                session_id,
+                new_session_id or session_id,
+                len((answer or "").strip()),
+            )
             return AgentRunResult(
                 answer=(answer or "").strip(),
                 session_id=new_session_id or session_id,

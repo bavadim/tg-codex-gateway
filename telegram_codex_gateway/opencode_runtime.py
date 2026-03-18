@@ -9,12 +9,15 @@ from typing import Dict, List, Optional
 
 
 PACKAGE_RESOURCES = "telegram_codex_gateway.resources.opencode"
+PERSISTENT_RUNTIME_ROOT = Path("/tmp/tg-agent-gateway/opencode")
 
 
 @dataclass
 class OpenCodeRuntime:
     env: Dict[str, str]
     temp_dir: Path
+    data_dir: Path
+    cache_dir: Path
 
 
 def _copy_resource_tree(source, destination: Path) -> None:
@@ -104,14 +107,20 @@ def _build_provider_config(env: Dict[str, str]) -> Optional[Dict[str, object]]:
     }
 
 
-def build_opencode_runtime(base_env: Dict[str, str]) -> OpenCodeRuntime:
+def _build_persistent_runtime_dirs(chat_id: int) -> tuple[Path, Path]:
+    root = PERSISTENT_RUNTIME_ROOT / str(chat_id)
+    data_dir = root / "xdg-data"
+    cache_dir = root / "xdg-cache"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir, cache_dir
+
+
+def build_opencode_runtime(base_env: Dict[str, str], chat_id: int) -> OpenCodeRuntime:
     temp_dir = Path(tempfile.mkdtemp(prefix="tg-opencode-"))
     config_dir = temp_dir / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
-    data_dir = temp_dir / "xdg-data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = temp_dir / "xdg-cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    data_dir, cache_dir = _build_persistent_runtime_dirs(chat_id)
 
     skills_root = config_dir / "skills"
     skills_source = resources.files(PACKAGE_RESOURCES).joinpath("skills")
@@ -158,7 +167,12 @@ def build_opencode_runtime(base_env: Dict[str, str]) -> OpenCodeRuntime:
     if content:
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(content)
 
-    return OpenCodeRuntime(env=env, temp_dir=temp_dir)
+    return OpenCodeRuntime(
+        env=env,
+        temp_dir=temp_dir,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+    )
 
 
 def cleanup_opencode_runtime(runtime: OpenCodeRuntime) -> None:

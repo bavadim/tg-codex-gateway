@@ -18,6 +18,11 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 tg-agent-gateway = "telegram_codex_gateway.cli:main"
 

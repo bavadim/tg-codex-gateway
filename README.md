@@ -47,6 +47,7 @@ cp env.example .env
 ```bash
 TELEGRAM_BOT_TOKEN=123456:your-bot-token
 ALLOWED_CHAT_USER_IDS=@your_username
+TELEGRAM_MODE=polling
 AGENT_BACKEND=opencode
 OPENCODE_BIN=opencode
 OPENCODE_MODEL=myopenai/compressa1
@@ -59,6 +60,7 @@ GH_TOKEN=your-github-token
 
 - `TELEGRAM_BOT_TOKEN` — токен бота от `@BotFather`
 - `ALLOWED_CHAT_USER_IDS` — кто может пользоваться ботом
+- `TELEGRAM_MODE` — режим запуска Telegram gateway: `polling` или `webhook`
 - `OPENAI_API_BASE` и `OPENAI_API_KEY` — настройки провайдера для `opencode`
 - `OPENCODE_MODEL` — model id в формате `provider/model`; для этого провайдера рабочий пример: `myopenai/compressa1`
 - `GH_TOKEN` — обязательный GitHub token для `gh`, через него gateway работает с issues и GitHub Projects
@@ -67,6 +69,62 @@ Gateway сам собирает runtime-конфиг для `opencode` из env.
 Gateway также принудительно включает для `opencode` режим без интерактивных permission prompts внутри `--workdir`: читать, редактировать файлы и запускать команды в проекте можно без дополнительных подтверждений. Доступ за пределы рабочей директории gateway не открывает.
 Gateway также принудительно использует только агент `build`: режим `plan` отключен и не должен использоваться.
 Для OpenAI-compatible провайдеров указывай `OPENAI_API_BASE` как базовый URL API, например `http://host:port/v1`. Суффикс `/responses` дописывать не нужно: `opencode` делает это сам.
+
+### Режим webhook
+
+По умолчанию gateway работает через long polling:
+
+```bash
+TELEGRAM_MODE=polling
+```
+
+Если нужен webhook, включи:
+
+```bash
+TELEGRAM_MODE=webhook
+TELEGRAM_WEBHOOK_LISTEN=0.0.0.0
+TELEGRAM_WEBHOOK_PORT=8080
+TELEGRAM_WEBHOOK_PATH=telegram
+TELEGRAM_WEBHOOK_URL=https://bot.example.com/telegram
+TELEGRAM_WEBHOOK_SECRET_TOKEN=change-me
+TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES=true
+```
+
+Что означает:
+
+- `TELEGRAM_WEBHOOK_LISTEN` — интерфейс, на котором gateway слушает HTTP
+- `TELEGRAM_WEBHOOK_PORT` — локальный порт HTTP-сервера
+- `TELEGRAM_WEBHOOK_PATH` — path webhook без обязательного ведущего `/`
+- `TELEGRAM_WEBHOOK_URL` — публичный HTTPS URL, который будет зарегистрирован в Telegram
+- `TELEGRAM_WEBHOOK_SECRET_TOKEN` — optional secret token для проверки запросов Telegram
+- `TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES` — сбрасывать ли старые pending updates при старте
+
+Требования для webhook:
+
+- `TELEGRAM_WEBHOOK_URL` должен быть публичным `https://` адресом
+- внешний reverse proxy должен проксировать `/<TELEGRAM_WEBHOOK_PATH>` на `TELEGRAM_WEBHOOK_LISTEN:TELEGRAM_WEBHOOK_PORT`
+- сертификат на внешнем `https://` должен быть валиден для Telegram
+
+Пример Nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name bot.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/bot.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bot.example.com/privkey.pem;
+
+    location /telegram {
+        proxy_pass http://127.0.0.1:8080/telegram;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+После этого запускай gateway как обычно, только с `TELEGRAM_MODE=webhook`. При старте он сам вызовет Telegram webhook registration через `python-telegram-bot`.
 
 ## GitHub: токен под нужным пользователем
 
@@ -146,6 +204,17 @@ set +a
 tg-agent-gateway --workdir /path/to/your/project
 ```
 
+Для webhook режим запуска тот же самый: все переключается только env-переменными.
+
+## Тесты
+
+Установи dev-зависимости и запусти приемочные тесты:
+
+```bash
+python -m pip install -e ".[dev]"
+pytest
+```
+
 ## Что важно
 
 - `--workdir` должен указывать на папку проекта
@@ -153,3 +222,4 @@ tg-agent-gateway --workdir /path/to/your/project
 - вместе с gateway поставляется skill `gh-pm` для управления GitHub issues и GitHub Projects через `gh`
 - `GH_TOKEN` должен быть задан в `.env`, без него GitHub-операции через `gh` не заработают
 - если бот должен пушить код, проверь `git`, SSH-ключ и `origin` по SSH заранее
+- в `webhook` режиме внешний reverse proxy и публичный HTTPS URL должны быть готовы до старта gateway

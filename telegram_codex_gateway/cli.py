@@ -47,6 +47,13 @@ class AppSettings:
     workdir: Path
     backend_name: str
     backend: AgentBackend
+    telegram_mode: str
+    webhook_listen: str
+    webhook_port: int
+    webhook_url_path: str
+    webhook_url: Optional[str]
+    webhook_secret_token: Optional[str]
+    webhook_drop_pending_updates: bool
 
 
 def parse_allowed_entries(raw: str) -> List[str]:
@@ -138,6 +145,17 @@ def build_group_prompt(chat_logs: Dict[int, List[str]], chat_id: int) -> str:
 
 def extract_message_text(message) -> str:
     return message.text or message.caption or ""
+
+
+def parse_bool_env(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def sanitize_filename(name: str) -> str:
@@ -542,11 +560,34 @@ def read_settings(workdir_value: str) -> AppSettings:
     allowed_entries = parse_allowed_entries(
         os.environ.get("ALLOWED_CHAT_USER_IDS", "")
     )
+    telegram_mode = (os.environ.get("TELEGRAM_MODE") or "polling").strip().lower()
+    webhook_listen = (os.environ.get("TELEGRAM_WEBHOOK_LISTEN") or "0.0.0.0").strip()
+    webhook_port_raw = (os.environ.get("TELEGRAM_WEBHOOK_PORT") or "8080").strip()
+    webhook_url_path = (os.environ.get("TELEGRAM_WEBHOOK_PATH") or "telegram").strip()
+    webhook_url = (os.environ.get("TELEGRAM_WEBHOOK_URL") or "").strip() or None
+    webhook_secret_token = (
+        os.environ.get("TELEGRAM_WEBHOOK_SECRET_TOKEN") or ""
+    ).strip() or None
+    webhook_drop_pending_updates = parse_bool_env(
+        os.environ.get("TELEGRAM_WEBHOOK_DROP_PENDING_UPDATES"),
+        default=True,
+    )
 
     if not telegram_bot_token:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
     if not allowed_entries:
         raise SystemExit("Missing ALLOWED_CHAT_USER_IDS")
+    if telegram_mode not in {"polling", "webhook"}:
+        raise SystemExit("TELEGRAM_MODE must be either 'polling' or 'webhook'")
+    try:
+        webhook_port = int(webhook_port_raw)
+    except ValueError as exc:
+        raise SystemExit("TELEGRAM_WEBHOOK_PORT must be an integer") from exc
+    if not webhook_url_path:
+        raise SystemExit("TELEGRAM_WEBHOOK_PATH must not be empty")
+    webhook_url_path = webhook_url_path.strip("/")
+    if telegram_mode == "webhook" and not webhook_url:
+        raise SystemExit("TELEGRAM_MODE=webhook requires TELEGRAM_WEBHOOK_URL")
 
     workdir = Path(workdir_value).expanduser().resolve()
     if not workdir.exists():
@@ -562,6 +603,13 @@ def read_settings(workdir_value: str) -> AppSettings:
         workdir=workdir,
         backend_name=backend_name,
         backend=backend,
+        telegram_mode=telegram_mode,
+        webhook_listen=webhook_listen,
+        webhook_port=webhook_port,
+        webhook_url_path=webhook_url_path,
+        webhook_url=webhook_url,
+        webhook_secret_token=webhook_secret_token,
+        webhook_drop_pending_updates=webhook_drop_pending_updates,
     )
 
 
@@ -609,8 +657,9 @@ def main() -> None:
         )
 
     logger.info(
-        "Startup: backend=%s workdir=%s allowed_users=%s allowed_chats=%s usernames=%s chat_usernames=%s",
+        "Startup: backend=%s telegram_mode=%s workdir=%s allowed_users=%s allowed_chats=%s usernames=%s chat_usernames=%s",
         settings.backend_name,
+        settings.telegram_mode,
         workdir,
         sorted(allowed_users),
         sorted(allowed_chats),
@@ -862,7 +911,25 @@ def main() -> None:
         group=1,
     )
 
-    app.run_polling()
+    if settings.telegram_mode == "webhook":
+        logger.info(
+            "Starting Telegram webhook: listen=%s port=%s path=/%s webhook_url=%s",
+            settings.webhook_listen,
+            settings.webhook_port,
+            settings.webhook_url_path,
+            settings.webhook_url,
+        )
+        app.run_webhook(
+            listen=settings.webhook_listen,
+            port=settings.webhook_port,
+            url_path=settings.webhook_url_path,
+            webhook_url=settings.webhook_url,
+            secret_token=settings.webhook_secret_token,
+            drop_pending_updates=settings.webhook_drop_pending_updates,
+        )
+        return
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
