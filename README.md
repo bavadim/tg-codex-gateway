@@ -61,65 +61,24 @@ GH_TOKEN=your-github-token
 - `ALLOWED_CHAT_USER_IDS` — кто может пользоваться ботом
 - `OPENAI_API_BASE` и `OPENAI_API_KEY` — настройки провайдера для `opencode`
 - `OPENCODE_MODEL` — model id в формате `provider/model`; для этого провайдера рабочий пример: `myopenai/compressa1`
-- `GH_TOKEN` — GitHub token для `gh`, нужен для headless-запуска или если бот должен работать без интерактивного `gh auth login`
+- `GH_TOKEN` — обязательный GitHub token для `gh`, через него gateway работает с issues и GitHub Projects
 
 Gateway сам собирает runtime-конфиг для `opencode` из env. Дополнительный `opencode.json` в проекте не нужен.
 Gateway также принудительно включает для `opencode` режим без интерактивных permission prompts внутри `--workdir`: читать, редактировать файлы и запускать команды в проекте можно без дополнительных подтверждений. Доступ за пределы рабочей директории gateway не открывает.
 Gateway также принудительно использует только агент `build`: режим `plan` отключен и не должен использоваться.
 Для OpenAI-compatible провайдеров указывай `OPENAI_API_BASE` как базовый URL API, например `http://host:port/v1`. Суффикс `/responses` дописывать не нужно: `opencode` делает это сам.
 
-## GitHub: вход под нужным пользователем
+## GitHub: токен под нужным пользователем
 
-`gh` нужно логинить под тем GitHub-пользователем, от имени которого бот будет:
+`GH_TOKEN` должен принадлежать тому GitHub-пользователю, от имени которого бот будет:
 
 - создавать и редактировать issues
 - менять items в GitHub Projects
 - пушить коммиты и открывать PR, если агент правит код
 
-Проверь, кто сейчас активен:
-
-```bash
-gh auth status
-```
-
-Если нужен другой пользователь, сначала разлогинь текущего:
-
-```bash
-gh auth logout
-```
-
-Потом залогинь нужный аккаунт:
-
-```bash
-gh auth login --web --git-protocol ssh
-```
-
-Если `gh` уже залогинен, но не хватает доступа к GitHub Projects, добавь scope:
-
-```bash
-gh auth refresh -s project
-```
-
-По документации GitHub CLI, для `gh project` нужен scope `project`, а для работы через `gh auth login --with-token` minimum classic scopes для `gh` включают `repo`, `read:org` и `gist`. Для добавления issue в GitHub Project через `gh issue create` тоже нужен `project`.
-
 ## Как получить токен для `gh`
 
-Есть два рабочих варианта.
-
-### Вариант 1. Через `gh auth login` в браузере
-
-Это самый простой способ для локальной машины:
-
-```bash
-gh auth login --web --git-protocol ssh
-gh auth refresh -s project
-```
-
-Так `gh` сохранит учетные данные локально. Этот вариант удобен, если gateway запускается в пользовательской сессии.
-
-### Вариант 2. Через Personal Access Token
-
-Это удобно для headless-запуска, `systemd` и серверов. Тогда положи токен в `GH_TOKEN`.
+Gateway использует только сценарий с Personal Access Token. Положи токен в `.env` как `GH_TOKEN=...`.
 
 #### Classic PAT
 
@@ -137,16 +96,9 @@ gh auth refresh -s project
 - `project`
 - `read:org`
 
-`gist` нужен для минимального дефолтного набора `gh auth login --with-token`, но для самого gateway обычно не является целевым разрешением. Если используешь именно `gh auth login --with-token`, учитывай это требование CLI.
-
 #### Fine-grained PAT
 
-Можно использовать и fine-grained token, но GitHub CLI отдельно предупреждает, что при `--with-token` он иногда ведет себя менее предсказуемо из-за узкой привязки к ресурсам. Для automation лучше либо:
-
-- экспортировать `GH_TOKEN` напрямую
-- либо использовать classic PAT, если нужен максимально простой и совместимый сценарий
-
-Если все же делаешь fine-grained token:
+Можно использовать и fine-grained token. Тогда:
 
 1. Открой `Settings` -> `Developer settings` -> `Personal access tokens` -> `Fine-grained tokens`.
 2. Выбери владельца токена, нужные репозитории и срок жизни.
@@ -199,5 +151,5 @@ tg-agent-gateway --workdir /path/to/your/project
 - `--workdir` должен указывать на папку проекта
 - если в проекте есть `AGENTS.md` и `.opencode/skills`, `opencode` их увидит
 - вместе с gateway поставляется skill `gh-pm` для управления GitHub issues и GitHub Projects через `gh`
-- для headless-сценария удобно хранить `GH_TOKEN` в `.env`, но для локального интерактивного запуска обычно достаточно `gh auth login`
+- `GH_TOKEN` должен быть задан в `.env`, без него GitHub-операции через `gh` не заработают
 - если бот должен пушить код, проверь `git`, SSH-ключ и `origin` по SSH заранее
