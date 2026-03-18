@@ -54,8 +54,8 @@ def _build_permission_config() -> Dict[str, str]:
         "codesearch": "allow",
         "lsp": "allow",
         "skill": "allow",
-        "doom_loop": "allow",
-        "question": "deny",
+        "doom_loop": "ask",
+        "question": "allow",
         "external_directory": "deny",
     }
 
