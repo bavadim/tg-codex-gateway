@@ -100,6 +100,8 @@ class OpenCodeBackend:
             cmd = [
                 self.binary,
                 "run",
+                "--agent",
+                "build",
                 "--format",
                 "json",
             ]

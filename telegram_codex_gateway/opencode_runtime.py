@@ -35,6 +35,39 @@ def _build_runtime_instructions() -> List[str]:
     return instructions
 
 
+def _build_permission_config() -> Dict[str, str]:
+    return {
+        "read": "allow",
+        "edit": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "allow",
+        "todowrite": "allow",
+        "todoread": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "codesearch": "allow",
+        "lsp": "allow",
+        "skill": "allow",
+        "doom_loop": "allow",
+        "question": "deny",
+        "external_directory": "deny",
+    }
+
+
+def _build_agent_config() -> Dict[str, object]:
+    return {
+        "default_agent": "build",
+        "agent": {
+            "plan": {
+                "disable": True,
+            }
+        },
+    }
+
+
 def _split_provider_model(raw_model: str) -> tuple[str, str]:
     provider, _, model_name = raw_model.partition("/")
     if provider and model_name:
@@ -92,6 +125,8 @@ def build_opencode_runtime(base_env: Dict[str, str]) -> OpenCodeRuntime:
 
     instructions = _build_runtime_instructions()
     content: Dict[str, object] = {"instructions": instructions} if instructions else {}
+    content["permission"] = _build_permission_config()
+    content.update(_build_agent_config())
     provider_config = _build_provider_config(env)
     if provider_config:
         content.update(provider_config)
@@ -107,6 +142,13 @@ def build_opencode_runtime(base_env: Dict[str, str]) -> OpenCodeRuntime:
                 merged = list(existing_payload.get("instructions", []))
                 merged.extend(instructions)
                 existing_payload["instructions"] = merged
+            existing_payload["permission"] = _build_permission_config()
+            existing_payload["default_agent"] = "build"
+            agents = existing_payload.setdefault("agent", {})
+            if isinstance(agents, dict):
+                plan = agents.setdefault("plan", {})
+                if isinstance(plan, dict):
+                    plan["disable"] = True
             if provider_config:
                 existing_payload.setdefault("model", provider_config["model"])
                 providers = existing_payload.setdefault("provider", {})
